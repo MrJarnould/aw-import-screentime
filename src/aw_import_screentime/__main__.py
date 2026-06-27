@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
 import sqlite3
 import shutil
 import threading
@@ -52,6 +54,7 @@ Storefront: TypeAlias = str
 Storefronts: TypeAlias = Sequence[Storefront]
 Events: TypeAlias = list[Event]
 Watermarks: TypeAlias = dict[DeviceId, float]
+EventIdentity: TypeAlias = tuple[str, Optional[int], Optional[str]]
 
 # --------------------------------------------------------------------------------------
 # Version
@@ -104,6 +107,12 @@ class Ctx:
     config: "AppConfig"
     config_path: Path
     config_error: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class OpenIntervalState:
+    bundle_id: str
+    start_cf: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,6 +526,16 @@ class ActivityWatchSink:
             logger.debug("Bucket %s already exists (status=%s)", bucket_id, status)
         return bucket_id
 
+    def _load_existing_event_keys(
+        self,
+        bucket: str,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> set[EventIdentity]:
+        existing = self.client.get_events(bucket, start=start, end=end)
+        return {_event_identity_key(event) for event in existing}
+
     def emit(self, bucket: str, events: Sequence[Event]) -> int:
         """
         Insert events into the given ActivityWatch bucket.
@@ -526,10 +545,57 @@ class ActivityWatchSink:
         """
         if not events:
             return 0
-        # Insert all events in a single call (explicit list to avoid generator reuse).
-        self.client.insert_events(bucket, list(events))
-        logger.info("Inserted %d events into %s", len(events), bucket)
-        return len(events)
+
+        start, end = _event_time_window(events)
+        existing_keys = self._load_existing_event_keys(bucket, start=start, end=end)
+
+        deduped: list[Event] = []
+        seen_keys = set(existing_keys)
+        skipped_duplicates = 0
+        for event in events:
+            key = _event_identity_key(event)
+            if key in seen_keys:
+                skipped_duplicates += 1
+                continue
+            deduped.append(event)
+            seen_keys.add(key)
+
+        if not deduped:
+            logger.info(
+                "Skipped %d duplicate events for %s; no new events to insert",
+                skipped_duplicates,
+                bucket,
+            )
+            return 0
+
+        self.client.insert_events(bucket, deduped)
+        logger.info(
+            "Inserted %d events into %s (%d duplicates skipped)",
+            len(deduped),
+            bucket,
+            skipped_duplicates,
+        )
+        return len(deduped)
+
+
+def _event_duration_microseconds(event: Event) -> Optional[int]:
+    if event.duration is None:
+        return None
+    return int(round(event.duration.total_seconds() * 1_000_000))
+
+
+def _event_identity_key(event: Event) -> EventIdentity:
+    data = event.data if isinstance(event.data, dict) else {}
+    app = data.get("app")
+    app_name = str(app) if app is not None else None
+    timestamp = event.timestamp.astimezone(UTC).isoformat()
+    return (timestamp, _event_duration_microseconds(event), app_name)
+
+
+def _event_time_window(events: Sequence[Event]) -> tuple[datetime, datetime]:
+    starts = [event.timestamp for event in events]
+    ends = [event.timestamp + (event.duration or timedelta(0)) for event in events]
+    return min(starts), max(ends)
 
 
 # --------------------------------------------------------------------------------------
@@ -588,34 +654,106 @@ def tail_device_files(device_id: DeviceId, *, limit: int) -> list[Path]:
 # --------------------------------------------------------------------------------------
 
 
-def load_watermarks() -> Watermarks:
-    """Load last seen cf_absolute_time per device from STATE_FILE."""
+def load_device_states() -> dict[DeviceId, "DeviceState"]:
+    """Load persisted per-device runtime state from STATE_FILE."""
     _migrate_legacy_state_file()
     try:
         with STATE_FILE.open("r") as f:
             data = json.load(f)
+        devices_raw = data.get("devices")
+        if isinstance(devices_raw, dict):
+            loaded: dict[DeviceId, DeviceState] = {}
+            for device_id, raw_state in devices_raw.items():
+                if not isinstance(raw_state, dict):
+                    continue
+                last_cf_raw = raw_state.get("last_cf", float("-inf"))
+                try:
+                    last_cf = float(last_cf_raw)
+                except (TypeError, ValueError):
+                    last_cf = float("-inf")
+
+                open_interval_raw = raw_state.get("open_interval")
+                open_interval: Optional[OpenIntervalState] = None
+                if isinstance(open_interval_raw, dict):
+                    bundle_id = open_interval_raw.get("bundle_id")
+                    start_cf_raw = open_interval_raw.get("start_cf")
+                    if isinstance(bundle_id, str):
+                        try:
+                            start_cf = float(start_cf_raw)
+                        except (TypeError, ValueError):
+                            start_cf = None
+                        if start_cf is not None:
+                            open_interval = OpenIntervalState(
+                                bundle_id=bundle_id,
+                                start_cf=start_cf,
+                            )
+
+                loaded[str(device_id)] = DeviceState(
+                    last_cf=last_cf,
+                    open_interval=open_interval,
+                )
+            return loaded
+
         raw = data.get("last_cf", {})
         if isinstance(raw, dict):
-            return {str(k): float(v) for k, v in raw.items()}
+            return {
+                str(k): DeviceState(last_cf=float(v))
+                for k, v in raw.items()
+            }
     except Exception:
         logger.debug("No prior watermark state or failed to read; starting fresh")
     return {}
 
 
-def save_watermarks(last_cf: Watermarks) -> None:
-    """Persist last seen cf_absolute_time per device to STATE_FILE.
+def load_watermarks() -> Watermarks:
+    """Backward-compatible view of persisted last_cf values."""
+    return {
+        device_id: state.last_cf
+        for device_id, state in load_device_states().items()
+    }
+
+
+def save_device_states(device_states: dict[DeviceId, "DeviceState"]) -> None:
+    """Persist per-device runtime state to STATE_FILE.
     Logs a warning only once per process if persistence fails.
     """
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
+        devices_payload = {}
+        last_cf_payload = {}
+        for device_id, state in device_states.items():
+            last_cf_payload[device_id] = state.last_cf
+            payload: dict[str, Any] = {"last_cf": state.last_cf}
+            if state.open_interval is not None:
+                payload["open_interval"] = {
+                    "bundle_id": state.open_interval.bundle_id,
+                    "start_cf": state.open_interval.start_cf,
+                }
+            devices_payload[device_id] = payload
         with STATE_FILE.open("w") as f:
-            json.dump({"last_cf": last_cf}, f)
+            json.dump(
+                {
+                    "last_cf": last_cf_payload,
+                    "devices": devices_payload,
+                },
+                f,
+            )
     except Exception:
-        if not getattr(save_watermarks, "_warned", False):
+        if not getattr(save_device_states, "_warned", False):
             logger.warning(
                 "Failed to persist watermark state to %s", STATE_FILE, exc_info=True
             )
-            setattr(save_watermarks, "_warned", True)
+            setattr(save_device_states, "_warned", True)
+
+
+def save_watermarks(last_cf: Watermarks) -> None:
+    """Backward-compatible state writer for last_cf-only callers."""
+    save_device_states(
+        {
+            device_id: DeviceState(last_cf=cf)
+            for device_id, cf in last_cf.items()
+        }
+    )
 
 
 # Per-device state dataclass for watermarks and tracking
@@ -624,6 +762,7 @@ class DeviceState:
     last_file: Optional[Path] = None
     last_cf: float = float("-inf")
     last_advance_wall: float = 0.0
+    open_interval: Optional[OpenIntervalState] = None
 
 
 # Consolidated per-device runtime view for the watcher
@@ -642,6 +781,91 @@ class NewEvents:
     new_last_file: Optional[Path]
     new_last_cf: Optional[float]
     dirty: bool
+
+
+WATCH_TAIL_FILE_LIMIT = 2
+WATCH_SAFETY_RESCAN_SECONDS = 60.0
+
+
+def read_new_events_for_device(
+    dev: DeviceId,
+    state: DeviceState,
+    *,
+    tail_limit: int = WATCH_TAIL_FILE_LIMIT,
+) -> NewEvents:
+    """Return decoded protobufs newer than the watermark without mutating state."""
+    files = tail_device_files(dev, limit=tail_limit)
+    if not files:
+        logger.debug("[%s] no files found", dev)
+        return NewEvents([], None, None, False)
+
+    newest = files[-1]
+    try:
+        newest.stat()
+    except FileNotFoundError:
+        logger.debug("[%s] newest file disappeared: %s", dev, newest)
+        return NewEvents([], None, None, False)
+
+    prev_file = state.last_file
+    prev_file_name: Optional[str] = prev_file.name if prev_file is not None else None
+    logger.debug(
+        "[%s] newest=%s last_file=%s last_cf=%.3f",
+        dev,
+        newest.name,
+        prev_file_name,
+        state.last_cf,
+    )
+
+    candidates = files if state.last_file != newest else [newest]
+
+    new_events: list[AppInFocusEventT] = []
+    try:
+        for fp in candidates:
+            for ev in iter_app_in_focus_events(fp):
+                cf = getattr(ev, "cf_absolute_time", None)
+                if cf is None or cf <= state.last_cf:
+                    continue
+                new_events.append(ev)
+    except Exception as e:
+        logger.debug("[%s] read_new_events_for_device(%s) error: %s", dev, newest, e)
+        return NewEvents([], None, None, False)
+
+    if not new_events:
+        logger.debug("[%s] no new events in candidates", dev)
+        return NewEvents([], None, None, False)
+
+    max_cf = max(getattr(e, "cf_absolute_time", state.last_cf) for e in new_events)
+    logger.debug(
+        "[%s] new events=%d; cf watermark: %.3f -> %.3f",
+        dev,
+        len(new_events),
+        state.last_cf,
+        max_cf,
+    )
+    return NewEvents(new_events, newest, max_cf, True)
+
+
+def drain_changed_devices(
+    changed: set[DeviceId],
+    changed_lock: threading.Lock,
+) -> set[DeviceId]:
+    with changed_lock:
+        to_scan = set(changed)
+        changed.clear()
+    return to_scan
+
+
+def determine_watch_scan_targets(
+    *,
+    woke: bool,
+    drained_changed: set[DeviceId],
+    all_device_ids: Sequence[DeviceId],
+) -> set[DeviceId]:
+    if drained_changed:
+        return drained_changed
+    if not woke:
+        return set(all_device_ids)
+    return set()
 
 
 # --------------------------------------------------------------------------------------
@@ -749,7 +973,7 @@ def lookup_app_title(
 
 
 def enrich_events_with_titles(
-    events: Iterable[Event],
+    events: Sequence[Event],
     *,
     storefronts: Storefronts,
 ) -> None:
@@ -815,14 +1039,38 @@ def stitch_intervals(
     Close intervals when the app loses focus or a different app gains focus.
     Do not close the last open interval here; it will be closed on a subsequent run.
     """
+    stitched, _ = stitch_intervals_with_state(events, tzinfo=tzinfo)
+    yield from stitched
+
+
+def stitch_intervals_with_state(
+    events: Iterable[AppInFocusEventT],
+    *,
+    tzinfo: dt_tzinfo,
+    initial_open_interval: Optional[OpenIntervalState] = None,
+) -> tuple[list[Event], Optional[OpenIntervalState]]:
+    """Stitch intervals while carrying forward an optional open foreground state."""
     current_bundle: Optional[str] = None
+    start_cf: Optional[float] = None
     start_ts: Optional[datetime] = None
+    stitched: list[Event] = []
+
+    if initial_open_interval is not None:
+        current_bundle = initial_open_interval.bundle_id
+        start_cf = initial_open_interval.start_cf
+        start_ts = datetime.fromtimestamp(
+            start_cf + APPLE_EPOCH_OFFSET,
+            tz=tzinfo,
+        )
 
     for ev in events:
         bundle = getattr(ev, "bundle_id", None)
         if not bundle:
             continue
-        ts = datetime.fromtimestamp(ev.cf_absolute_time + APPLE_EPOCH_OFFSET, tz=tzinfo)
+        cf_absolute_time = getattr(ev, "cf_absolute_time", None)
+        if cf_absolute_time is None:
+            continue
+        ts = datetime.fromtimestamp(cf_absolute_time + APPLE_EPOCH_OFFSET, tz=tzinfo)
         in_foreground = bool(getattr(ev, "in_foreground", False))
 
         # Ignore duplicate "gain focus" on same bundle
@@ -831,7 +1079,7 @@ def stitch_intervals(
 
         # Start new interval
         if in_foreground and current_bundle is None:
-            current_bundle, start_ts = bundle, ts
+            current_bundle, start_cf, start_ts = bundle, cf_absolute_time, ts
             continue
 
         same_bundle_loss = bundle == current_bundle and not in_foreground
@@ -843,8 +1091,12 @@ def stitch_intervals(
             and start_ts
             and ts > start_ts
         ):
-            yield Event(
-                timestamp=start_ts, duration=ts - start_ts, data={"app": current_bundle}
+            stitched.append(
+                Event(
+                    timestamp=start_ts,
+                    duration=ts - start_ts,
+                    data={"app": current_bundle},
+                )
             )
             logger.debug(
                 "Closed interval: %s %s..%s (%.2fs)",
@@ -855,10 +1107,18 @@ def stitch_intervals(
             )
 
         # Update state
-        if in_foreground:
-            current_bundle, start_ts = bundle, ts
-        else:
-            current_bundle, start_ts = None, None
+        if same_bundle_loss:
+            current_bundle, start_cf, start_ts = None, None, None
+        elif switch_gain:
+            current_bundle, start_cf, start_ts = bundle, cf_absolute_time, ts
+
+    open_interval = None
+    if current_bundle is not None and start_cf is not None:
+        open_interval = OpenIntervalState(
+            bundle_id=current_bundle,
+            start_cf=start_cf,
+        )
+    return stitched, open_interval
 
 
 def clip_events_since(events: Iterable[Event], since: datetime) -> Iterator[Event]:
@@ -1400,6 +1660,35 @@ def cmd_watch(
     changed: set[str] = set()
     retry_lock = threading.Lock()
     scheduled_retries: set[str] = set()
+    stop_event = threading.Event()
+    parent_pid = os.getppid()
+
+    def request_shutdown(reason: str) -> None:
+        if not stop_event.is_set():
+            logger.info("%s", reason)
+        stop_event.set()
+        wake.set()
+
+    def _signal_handler(signum: int, _frame: Any) -> None:
+        request_shutdown(f"received signal {signum}, stopping watcher")
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    def parent_exited() -> bool:
+        return os.getppid() != parent_pid
+
+    def monitor_parent() -> None:
+        while not stop_event.wait(1.0):
+            if parent_exited():
+                request_shutdown("parent process exited, stopping watcher")
+                break
+
+    threading.Thread(
+        target=monitor_parent,
+        name="aw-screentime-parent-monitor",
+        daemon=True,
+    ).start()
 
     def schedule_retry(dev: DeviceId, *, delay: Optional[float] = None) -> None:
         actual_delay = retry_delay_seconds if delay is None else delay
@@ -1478,14 +1767,15 @@ def cmd_watch(
     )
 
     # Consolidated per-device runtime objects
-    persisted = load_watermarks()
+    persisted = load_device_states()
     runtimes: dict[DeviceId, DeviceRuntime] = {
         dev: DeviceRuntime(
             device_id=dev,
             state=DeviceState(
                 last_file=None,
-                last_cf=persisted.get(dev, float("-inf")),
+                last_cf=persisted.get(dev, DeviceState()).last_cf,
                 last_advance_wall=time.monotonic(),
+                open_interval=persisted.get(dev, DeviceState()).open_interval,
             ),
         )
         for dev in ids
@@ -1493,86 +1783,50 @@ def cmd_watch(
 
     logger.debug("state init: runtimes=%s", runtimes)
 
-    sink = ActivityWatchSink(client, bucket_suffix=None)
+    sink = ActivityWatchSink(client, bucket_suffix=resolve_bucket_suffix(None, config))
     for dev in ids:
         runtimes[dev].bucket_id = sink.ensure_bucket(dev)
 
-    def read_new_events(dev: DeviceId, state: DeviceState) -> NewEvents:
-        """Return decoded protobufs newer than the watermark without mutating `state`."""
-        # Look at newest 1–2 files; 2 handles rotation without gaps.
-        files = tail_device_files(dev, limit=2)
-        if not files:
-            logger.debug("[%s] no files found", dev)
-            return NewEvents([], None, None, False)
-
-        newest = files[-1]
-        try:
-            newest.stat()
-        except FileNotFoundError:
-            logger.debug("[%s] newest file disappeared: %s", dev, newest)
-            return NewEvents([], None, None, False)
-
-        prev_file = state.last_file
-        prev_file_name: Optional[str] = (
-            prev_file.name if prev_file is not None else None
-        )
-        logger.debug(
-            "[%s] newest=%s last_file=%s last_cf=%.3f",
-            dev,
-            newest.name,
-            prev_file_name,
-            state.last_cf,
-        )
-
-        # If the newest file changed (rotation), scan both; else only newest.
-        candidates = files if state.last_file != newest else [newest]
-
-        new_events: list[AppInFocusEventT] = []
-        try:
-            for fp in candidates:
-                for ev in iter_app_in_focus_events(fp):
-                    cf = getattr(ev, "cf_absolute_time", None)
-                    if cf is None or cf <= state.last_cf:
-                        continue
-                    new_events.append(ev)
-        except Exception as e:
-            logger.debug("[%s] read_new_events(%s) error: %s", dev, newest, e)
-            return NewEvents([], None, None, False)
-
-        if not new_events:
-            logger.debug("[%s] no new events in candidates", dev)
-            return NewEvents([], None, None, False)
-
-        max_cf = max(getattr(e, "cf_absolute_time", state.last_cf) for e in new_events)
-        logger.debug(
-            "[%s] new events=%d; cf watermark: %.3f -> %.3f",
-            dev,
-            len(new_events),
-            state.last_cf,
-            max_cf,
-        )
-        return NewEvents(new_events, newest, max_cf, True)
+    # Do an immediate catch-up pass on startup so already-present unread events
+    # are not missed while waiting for the first filesystem notification.
+    with changed_lock:
+        changed.update(ids)
+    wake.set()
 
     # main loop (purely event-driven: no timeout polling)
     with client:
         try:
-            while True:
-                # Block until watchdog reports a change
-                wake.wait()
-                wake.clear()
+            while not stop_event.is_set():
+                if parent_exited():
+                    request_shutdown("parent process exited, stopping watcher")
+                    break
+                woke = wake.wait(timeout=WATCH_SAFETY_RESCAN_SECONDS)
+                if woke:
+                    wake.clear()
+                if stop_event.is_set():
+                    break
+                if parent_exited():
+                    request_shutdown("parent process exited, stopping watcher")
+                    break
 
-                # Atomically snapshot and drain changed devices
-                with changed_lock:
-                    to_scan = set(changed)
-                    changed.clear()
-
+                to_scan = determine_watch_scan_targets(
+                    woke=woke,
+                    drained_changed=drain_changed_devices(changed, changed_lock),
+                    all_device_ids=ids,
+                )
                 if not to_scan:
                     continue  # spurious wake-ups; loop again
+                if not woke:
+                    logger.debug(
+                        "Safety rescan triggered after %.1fs idle; devices=%s",
+                        WATCH_SAFETY_RESCAN_SECONDS,
+                        sorted(to_scan),
+                    )
 
                 need_flush = False
                 for dev in to_scan:
                     state = runtimes[dev].state
-                    res = read_new_events(dev, state)
+                    res = read_new_events_for_device(dev, state)
 
                     if not res.events:
                         continue
@@ -1580,46 +1834,50 @@ def cmd_watch(
                     # Ensure chronological order for stitching
                     res.events.sort(key=lambda e: getattr(e, "cf_absolute_time", 0.0))
 
-                    # Stitch protobuf focus changes into AW interval events
-                    stitched_iter = stitch_intervals(res.events, tzinfo=tzinfo)
-                    events = list(stitched_iter)
-                    if not events:
-                        continue
+                    # Stitch protobuf focus changes into AW interval events,
+                    # carrying over any persisted open interval from the prior run.
+                    events, open_interval = stitch_intervals_with_state(
+                        res.events,
+                        tzinfo=tzinfo,
+                        initial_open_interval=state.open_interval,
+                    )
 
-                    # Optional: enrich with titles
-                    enrich_events_with_titles(events, storefronts=storefronts)
+                    if events:
+                        # Optional: enrich with titles
+                        enrich_events_with_titles(events, storefronts=storefronts)
 
-                    bucket_id = runtimes[dev].bucket_id
-                    if not bucket_id:
-                        logger.error("[%s] no bucket_id; skipping insert", dev)
-                        schedule_retry(dev)
-                        continue
+                        bucket_id = runtimes[dev].bucket_id
+                        if not bucket_id:
+                            logger.error("[%s] no bucket_id; skipping insert", dev)
+                            schedule_retry(dev)
+                            continue
 
-                    try:
-                        sink.emit(bucket_id, events)
-                    except requests.RequestException as e:
-                        status = getattr(
-                            getattr(e, "response", None), "status_code", None
-                        )
-                        logger.error(
-                            "[%s] insert_events failed: status=%s error=%s",
-                            dev,
-                            status,
-                            e,
-                        )
-                        schedule_retry(dev)
-                        continue
+                        try:
+                            sink.emit(bucket_id, events)
+                        except requests.RequestException as e:
+                            status = getattr(
+                                getattr(e, "response", None), "status_code", None
+                            )
+                            logger.error(
+                                "[%s] insert_events failed: status=%s error=%s",
+                                dev,
+                                status,
+                                e,
+                            )
+                            schedule_retry(dev)
+                            continue
 
                     if res.new_last_file is not None:
                         state.last_file = res.new_last_file
                     if res.new_last_cf is not None:
                         state.last_cf = res.new_last_cf
+                    state.open_interval = open_interval
                     state.last_advance_wall = time.monotonic()
                     if res.dirty:
                         need_flush = True
 
                 if need_flush:
-                    save_watermarks({d: rt.state.last_cf for d, rt in runtimes.items()})
+                    save_device_states({d: rt.state for d, rt in runtimes.items()})
         finally:
             # Clean shutdown of observer if it was started
             if observer is not None:
